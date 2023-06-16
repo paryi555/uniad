@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmcv.runner import auto_fp16
 from mmdet.models import DETECTORS
 from mmdet3d.core import bbox3d2result
@@ -28,7 +29,9 @@ class UniADTrack(MVXTwoStageDetector):
         self, 
         use_grid_mask=False,
         img_backbone=None,
+        bev_backbone=None,
         img_neck=None,
+        bev_neck=None,
         pts_bbox_head=None,
         train_cfg=None,
         test_cfg=None,
@@ -73,7 +76,9 @@ class UniADTrack(MVXTwoStageDetector):
     ):
         super(UniADTrack, self).__init__(
             img_backbone=img_backbone,
+            bev_backbone=bev_backbone,
             img_neck=img_neck,
+            bev_neck=bev_neck,
             pts_bbox_head=pts_bbox_head,
             train_cfg=train_cfg,
             test_cfg=test_cfg,
@@ -363,14 +368,116 @@ class UniADTrack(MVXTwoStageDetector):
         assert bev_embed.shape[0] == self.bev_h * self.bev_w
         return bev_embed, bev_pos
 
+    def get_reference_points(H, W, Z=8, num_points_in_pillar=4, dim='3d', bs=1, device='cuda', dtype=torch.float):
+        """Get the reference points used in SCA and TSA.
+        Args:
+            H, W: spatial shape of bev.
+            Z: hight of pillar.
+            D: sample D points uniformly from each pillar.
+            device (obj:`device`): The device where
+                reference_points should be.
+        Returns:
+            Tensor: reference points used in decoder, has \
+                shape (bs, num_keys, num_levels, 2).
+        """
+
+        # reference points in 3D space, used in spatial cross-attention (SCA)
+        if dim == '3d':
+            zs = torch.linspace(0.5, Z - 0.5, num_points_in_pillar, dtype=dtype,
+                                device=device).view(-1, 1, 1).expand(num_points_in_pillar, H, W) / Z
+            xs = torch.linspace(0.5, W - 0.5, W, dtype=dtype,
+                                device=device).view(1, 1, W).expand(num_points_in_pillar, H, W) / W
+            ys = torch.linspace(0.5, H - 0.5, H, dtype=dtype,
+                                device=device).view(1, H, 1).expand(num_points_in_pillar, H, W) / H
+            ref_3d = torch.stack((xs, ys, zs), -1)
+            ref_3d = ref_3d.permute(0, 3, 1, 2).flatten(2).permute(0, 2, 1)
+            ref_3d = ref_3d[None].repeat(bs, 1, 1, 1)
+            return ref_3d
+
+        # reference points on 2D bev plane, used in temporal self-attention (TSA).
+        elif dim == '2d':
+            ref_y, ref_x = torch.meshgrid(
+                torch.linspace(
+                    0.5, H - 0.5, H, dtype=dtype, device=device),
+                torch.linspace(
+                    0.5, W - 0.5, W, dtype=dtype, device=device)
+            )
+            ref_y = ref_y.reshape(-1)[None] / H
+            ref_x = ref_x.reshape(-1)[None] / W
+            ref_2d = torch.stack((ref_x, ref_y), -1)
+            ref_2d = ref_2d.repeat(bs, 1, 1).unsqueeze(2)
+            return ref_2d
+
+    def shift_prev_bev_feature(self, prev_bev_list, l2g_r0, l2g_t0, l2g_r1, l2g_t1):
+        # prev_bev_list shape  (bs, len, bev_h, bev_w, dim)
+        # img_metas list bs (list len) key ( ego2global_rotation ego2global_translation )
+        bs, len, _, dim = prev_bev_list.shape
+        device = prev_bev_list.device
+        prev_bev_list = prev_bev_list.view(bs * len, self.bev_h, self.bev_w, dim).permute(0, 3, 1, 2)
+        ref_2d = self.get_reference_points(
+            self.bev_h, self.bev_w, dim='2d', bs=bs * len, device=device, dtype=prev_bev_list.dtype)
+        grid = ref_2d.squeeze_(2).view(bs * len, self.bev_h, self.bev_w, 2)
+
+        grid[..., 0] = grid[..., 0] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0]
+        grid[..., 1] = grid[..., 1] * (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1]
+
+        grid = torch.cat(
+            (grid, torch.zeros_like(grid[..., :1]), torch.ones_like(grid[..., :1])), -1)
+
+        pre_ego2global = torch.eye(4).unsqueeze_(0).unsqueeze_(0).repeat(bs, len, 1, 1)
+        cur_ego2global = torch.eye(4).unsqueeze_(0).repeat(bs, 1, 1)
+
+        shift_feature_mask = torch.ones((bs, len))
+        for i in range(bs):
+            cur_ego2global[i, :3, :3] = l2g_r1
+            cur_ego2global[i, :3, 3] = l2g_t1
+            for j in range(len):
+                pre_ego2global[i, j, :3, :3] = l2g_r0
+                pre_ego2global[i, j, :3, 3] = l2g_t0
+
+        pre_ego2global = pre_ego2global.view(bs * len, 4, 4)
+        cur_ego2global = cur_ego2global.unsqueeze_(1).repeat(1, len, 1, 1).view(bs * len, 4, 4)
+        global2pre_ego = torch.linalg.inv(pre_ego2global)
+
+        grid_shift = torch.matmul(cur_ego2global.to(device),
+                                  grid.view(bs * len, self.bev_h * self.bev_w, 4).permute(0, 2, 1))
+        grid_shift = torch.matmul(global2pre_ego.to(device), grid_shift)
+        grid_shift = grid_shift.permute(0, 2, 1).view(bs * len, self.bev_h, self.bev_w, 4)[..., :2]
+
+        grid_shift[..., 0] = grid_shift[..., 0] / (self.pc_range[3])
+        grid_shift[..., 1] = grid_shift[..., 1] / (self.pc_range[4])
+
+        shift_feature = F.grid_sample(prev_bev_list, grid_shift, align_corners=False)
+
+        return shift_feature.view(bs, len, dim, self.bev_h, self.bev_w), shift_feature_mask
+
+    def extract_bev_feat(self, bev_feat):
+        """Extract features of images."""
+        if bev_feat is None:
+            return None
+        assert bev_feat.dim() == 5
+        B, N, C, H, W = bev_feat.size()
+        bev_feat = bev_feat.reshape(B * N, C, H, W)
+        # if self.use_grid_mask:
+        #     img = self.grid_mask(bev_feat)
+        bev_feat = self.bev_backbone(bev_feat)
+        if isinstance(bev_feat, dict):
+            bev_feat = list(bev_feat.values())
+        bev_feat = self.bev_neck(bev_feat)
+        bev_feat_reshaped = bev_feat.view(B * N, C//2, H, W)
+        return bev_feat_reshaped
+
     @auto_fp16(apply_to=("img", "prev_bev"))
     def _forward_single_frame(
         self,
         img,
         img_metas,
+        prev_bev_list,
         track_instances,
         prev_img,
         prev_img_metas,
+        l2g_r0=None,
+        l2g_t0=None,
         l2g_r1=None,
         l2g_t1=None,
         l2g_r2=None,
@@ -391,10 +498,24 @@ class UniADTrack(MVXTwoStageDetector):
                 so no need to call velocity update
         """
         # NOTE: You can replace BEVFormer with other BEV encoder and provide bev_embed here
-        bev_embed, bev_pos = self.get_bevs(
-            img, img_metas,
-            prev_img=prev_img, prev_img_metas=prev_img_metas,
-        )
+        bev_embed, bev_pos = self.get_bevs(img, img_metas)
+        # reshape the bev_embed
+        dim, _, _ = bev_embed.size()
+        w = h = int(math.sqrt(dim))
+        assert h == w == 100
+
+        bev_feat = rearrange(bev_embed, '(h w) b c -> b c h w', h=h, w=w)  # [1, 256, 100, 100]
+        # bev_feat = nn.Upsample(scale_factor=2)(bev_feat)  # [1, 256, 200, 200] [bs, dim, h, w]
+        bev_feat = bev_feat.permute(0, 2, 3, 1)           # [1, 100, 100, 256] [bs, h, w, dim]
+        bev_feat = bev_feat.unsequeeze(1)                 # [1, 1, 100, 100, 256] [bs, len, h, w, dim]
+
+        if prev_bev_list is not None:
+            shift_feature, shift_feature_mask = \
+                self.shift_prev_bev_feature(prev_bev_list[0], l2g_r0, l2g_t0, l2g_r1, l2g_t1) # [1, 1, 256, 100, 100][bs, len, dim, h, w]
+            x = torch.cat((shift_feature, bev_feat.permute(0, 1, 4, 2, 3)), dim=2)  # [1, 1, 512, 100, 100][bs, len, dim*2, h, w]
+            bev_feat = self.extract_bev_feat(x)  # [1, 256, 100, 100] [bs, dim, h, w]
+            bev_embed = rearrange(bev_feat, 'b c h w -> (h w) b c', h=h, w=w)  # [10000, 1, 256]
+            bev_feat = bev_feat.unsequeeze(1).permute(0, 1, 3, 4, 2)  # [1, 1, 100, 100, 256] [bs, len, h, w, dim]
 
         det_output = self.pts_bbox_head.get_detections(
             bev_embed,
@@ -480,7 +601,7 @@ class UniADTrack(MVXTwoStageDetector):
         tmp["track_instances"] = track_instances
         out_track_instances = self.query_interact(tmp)
         out["track_instances"] = out_track_instances
-        return out
+        return bev_feat, out
 
     def select_active_track_query(self, track_instances, active_index, img_metas, with_mask=True):
         result_dict = self._track_instances2results(track_instances[active_index], img_metas, with_mask=with_mask)
@@ -540,7 +661,7 @@ class UniADTrack(MVXTwoStageDetector):
         self.criterion.initialize_for_single_clip(gt_instances_list)
 
         out = dict()
-
+        prev_bev_list = []
         for i in range(num_frame):
             prev_img = img[:, :i, ...] if i != 0 else img[:, :1, ...]
             prev_img_metas = copy.deepcopy(img_metas)
@@ -556,16 +677,26 @@ class UniADTrack(MVXTwoStageDetector):
                 l2g_r2 = l2g_r_mat[0][i + 1]
                 l2g_t2 = l2g_t[0][i + 1]
                 time_delta = timestamp[0][i + 1] - timestamp[0][i]
+            if i == 0:
+                l2g_r0 = None
+                l2g_t0 = None
+            else:
+                l2g_r0 = l2g_r_mat[0][i - 1]
+                l2g_t0 = l2g_t[0][i - 1]
+
             all_query_embeddings = []
             all_matched_idxes = []
             all_instances_pred_logits = []
             all_instances_pred_boxes = []
-            frame_res = self._forward_single_frame(
+            prev_bev_list[0], frame_res = self._forward_single_frame(
                 img_single,
                 img_metas_single,
+                prev_bev_list,
                 track_instances,
                 prev_img,
                 prev_img_metas,
+                l2g_r0,
+                l2g_t0,
                 l2g_r_mat[0][i],
                 l2g_t[0][i],
                 l2g_r2,

@@ -76,7 +76,7 @@ model = dict(
     pc_range=point_cloud_range,
     img_backbone=dict(
         type="ResNet",
-        depth=101,
+        depth=18,
         num_stages=4,
         out_indices=(1, 2, 3),
         frozen_stages=4,
@@ -88,6 +88,14 @@ model = dict(
         ),  # original DCNv2 will print log when perform load_state_dict
         stage_with_dcn=(False, False, True, True),
     ),
+    bev_backbone=dict(
+        type='ResNet',
+        depth=18,
+        num_stages=4,
+        out_indices=(2, 3),
+        norm_cfg=dict(type='SyncBN', requires_grad=True),
+        norm_eval=False,
+        style='pytorch'),
     img_neck=dict(
         type="FPN",
         in_channels=[512, 1024, 2048],
@@ -97,6 +105,14 @@ model = dict(
         num_outs=4,
         relu_before_extra_convs=True,
     ),
+    bev_neck=dict(
+        type='FPN',
+        in_channels=[512],
+        out_channels=_dim_,
+        start_level=0,
+        add_extra_convs='on_output',
+        num_outs=1,
+        relu_before_extra_convs=True),
     freeze_img_modules=True,  # set fix feats to true can fix the backbone
     freeze_bev_encoder=True,
     score_thresh=0.4,
